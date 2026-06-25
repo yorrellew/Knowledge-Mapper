@@ -120,7 +120,6 @@ export default function App() {
 
   // Node adjustment handlers
   const handleUpdateNodesList = (updatedList: EducationalNode[]) => {
-    if (isReadOnly) return;
     setNodes(updatedList);
   };
 

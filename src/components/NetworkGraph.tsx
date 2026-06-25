@@ -45,6 +45,16 @@ export default function NetworkGraph({
   const [draggedNodeId, setDraggedNodeId] = useState<string | null>(null);
   const [nodeDragOffset, setNodeDragOffset] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const nodeClickStartRef = useRef<{ id: string; clientX: number; clientY: number; time: number } | null>(null);
+  const layoutAnimRef = useRef<number | null>(null);
+
+  // Clean up any active layout animation on unmount
+  useEffect(() => {
+    return () => {
+      if (layoutAnimRef.current !== null) {
+        cancelAnimationFrame(layoutAnimRef.current);
+      }
+    };
+  }, []);
 
   // Creation Modals
   const [isAddNodeOpen, setIsAddNodeOpen] = useState<boolean>(false);
@@ -88,46 +98,110 @@ export default function NetworkGraph({
   const handleAutoLayout = () => {
     if (nodes.length === 0) return;
 
-    const iterations = 150; // runs for about 150 frames (~2.5s)
-    let frame = 0;
+    // Cancel any active animation frame
+    if (layoutAnimRef.current !== null) {
+      cancelAnimationFrame(layoutAnimRef.current);
+    }
 
-    // Copy nodes to work on them
-    let currentNodes = [...nodes];
-    
-    // Target spring length for connected nodes
-    const springLength = 320; 
-    const springStrength = 0.05;
-    const repulsionStrength = 120000;
-    const gravityStrength = 0.012;
-    const damping = 0.82;
+    // 1. Detect connected components (clusters)
+    const clusters: Record<string, number> = {};
+    let clusterCount = 0;
+    const visited = new Set<string>();
+
+    const adj: Record<string, string[]> = {};
+    nodes.forEach((n) => {
+      adj[n.id] = [];
+    });
+    relations.forEach((r) => {
+      if (adj[r.sourceId] && adj[r.targetId]) {
+        adj[r.sourceId].push(r.targetId);
+        adj[r.targetId].push(r.sourceId);
+      }
+    });
+
+    nodes.forEach((node) => {
+      if (!visited.has(node.id)) {
+        clusterCount++;
+        const queue = [node.id];
+        visited.add(node.id);
+        while (queue.length > 0) {
+          const curr = queue.shift()!;
+          clusters[curr] = clusterCount;
+          adj[curr]?.forEach((neighbor) => {
+            if (!visited.has(neighbor)) {
+              visited.add(neighbor);
+              queue.push(neighbor);
+            }
+          });
+        }
+      }
+    });
+
+    // Determine target center for each cluster to keep them well-spaced on a circular or grid layout
+    const clusterCenters: Record<number, { x: number; y: number }> = {};
+    const baseCenterX = 450;
+    const baseCenterY = 300;
+
+    if (clusterCount <= 1) {
+      clusterCenters[1] = { x: baseCenterX, y: baseCenterY };
+    } else {
+      // Space clusters dynamically around the center
+      const clusterRadius = Math.max(320, clusterCount * 140);
+      for (let c = 1; c <= clusterCount; c++) {
+        const angle = ((c - 1) / clusterCount) * 2 * Math.PI;
+        clusterCenters[c] = {
+          x: baseCenterX + Math.cos(angle) * clusterRadius,
+          y: baseCenterY + Math.sin(angle) * clusterRadius,
+        };
+      }
+    }
+
+    // Parameters for simulated annealing to find optimal layout in memory
+    const totalSimIterations = 240;
+    const springLength = 240; 
+    const springStrength = 0.08;
+    const repulsionStrength = 150000;
+    const gravityStrength = 0.025; 
+    const damping = 0.80;
+
+    // Jitter initial duplicate positions to prevent divide-by-zero or overlap traps
+    let simNodes = nodes.map((node, index) => {
+      const isDuplicate = nodes.some((n, idx) => idx < index && n.x === node.x && n.y === node.y);
+      if (isDuplicate) {
+        return {
+          ...node,
+          x: node.x + (Math.random() - 0.5) * 60,
+          y: node.y + (Math.random() - 0.5) * 60,
+        };
+      }
+      return node;
+    });
 
     // Initialize velocities
-    const velocities = currentNodes.reduce((acc, node) => {
+    const velocities = simNodes.reduce((acc, node) => {
       acc[node.id] = { vx: 0, vy: 0 };
       return acc;
     }, {} as Record<string, { vx: number; vy: number }>);
 
-    const step = () => {
-      if (frame >= iterations) return;
-
-      // Calculate forces for each node
-      const forces = currentNodes.reduce((acc, node) => {
+    // Run physics synchronously in memory to find the optimal settled layout positions
+    for (let simFrame = 0; simFrame < totalSimIterations; simFrame++) {
+      const forces = simNodes.reduce((acc, node) => {
         acc[node.id] = { fx: 0, fy: 0 };
         return acc;
       }, {} as Record<string, { fx: number; fy: number }>);
 
-      // 1. Repulsion between all pairs
-      for (let i = 0; i < currentNodes.length; i++) {
-        const u = currentNodes[i];
-        for (let j = i + 1; j < currentNodes.length; j++) {
-          const v = currentNodes[j];
-          
+      // Repulsion + Overlap Prevention
+      for (let i = 0; i < simNodes.length; i++) {
+        const u = simNodes[i];
+        for (let j = i + 1; j < simNodes.length; j++) {
+          const v = simNodes[j];
+
           const dx = (u.x + nodeWidth / 2) - (v.x + nodeWidth / 2);
           const dy = (u.y + nodeHeight / 2) - (v.y + nodeHeight / 2);
-          const distSq = dx * dx + dy * dy + 1; // avoid division by zero
+          const distSq = dx * dx + dy * dy + 1;
           const dist = Math.sqrt(distSq);
 
-          if (dist < 900) {
+          if (dist < 1200) {
             const force = repulsionStrength / distSq;
             const fx = (dx / dist) * force;
             const fy = (dy / dist) * force;
@@ -137,20 +211,37 @@ export default function NetworkGraph({
             forces[v.id].fx -= fx;
             forces[v.id].fy -= fy;
           }
+
+          // Bounding box separation to completely prevent node overlaps
+          const minSeparationX = nodeWidth + 60; // 60px padding
+          const minSeparationY = nodeHeight + 45; // 45px padding
+          const overlapX = minSeparationX - Math.abs(dx);
+          const overlapY = minSeparationY - Math.abs(dy);
+
+          if (overlapX > 0 && overlapY > 0) {
+            const pushForceX = overlapX * 0.25;
+            const pushForceY = overlapY * 0.25;
+            const dirX = dx >= 0 ? 1 : -1;
+            const dirY = dy >= 0 ? 1 : -1;
+
+            forces[u.id].fx += dirX * pushForceX;
+            forces[u.id].fy += dirY * pushForceY;
+            forces[v.id].fx -= dirX * pushForceX;
+            forces[v.id].fy -= dirY * pushForceY;
+          }
         }
       }
 
-      // 2. Attraction along relations (connected nodes)
+      // Attraction along relations
       relations.forEach((rel) => {
-        const u = currentNodes.find((n) => n.id === rel.sourceId);
-        const v = currentNodes.find((n) => n.id === rel.targetId);
+        const u = simNodes.find((n) => n.id === rel.sourceId);
+        const v = simNodes.find((n) => n.id === rel.targetId);
         if (!u || !v) return;
 
         const dx = (v.x + nodeWidth / 2) - (u.x + nodeWidth / 2);
         const dy = (v.y + nodeHeight / 2) - (u.y + nodeHeight / 2);
         const dist = Math.sqrt(dx * dx + dy * dy) || 1;
 
-        // Hooke's Law: F = k * (dist - L)
         const displacement = dist - springLength;
         const force = springStrength * displacement;
         const fx = (dx / dist) * force;
@@ -162,27 +253,35 @@ export default function NetworkGraph({
         forces[v.id].fy -= fy;
       });
 
-      // 3. Central gravity to keep layout centered around coordinate space (e.g. 400, 250)
-      const centerTargetX = 400;
-      const centerTargetY = 250;
-      currentNodes.forEach((node) => {
-        const dx = centerTargetX - (node.x + nodeWidth / 2);
-        const dy = centerTargetY - (node.y + nodeHeight / 2);
-        
-        forces[node.id].fx += dx * gravityStrength;
-        forces[node.id].fy += dy * gravityStrength;
+      // Cluster gravity
+      simNodes.forEach((node) => {
+        const clusterId = clusters[node.id] || 1;
+        const target = clusterCenters[clusterId] || { x: baseCenterX, y: baseCenterY };
+
+        const dx = target.x - (node.x + nodeWidth / 2);
+        const dy = target.y - (node.y + nodeHeight / 2);
+
+        let gfx = dx * gravityStrength;
+        let gfy = dy * gravityStrength;
+        const gForce = Math.sqrt(gfx * gfx + gfy * gfy);
+        const maxGravityForce = 5;
+        if (gForce > maxGravityForce) {
+          gfx = (gfx / gForce) * maxGravityForce;
+          gfy = (gfy / gForce) * maxGravityForce;
+        }
+
+        forces[node.id].fx += gfx;
+        forces[node.id].fy += gfy;
       });
 
-      // Update positions
-      currentNodes = currentNodes.map((node) => {
+      // Update in-memory position
+      simNodes = simNodes.map((node) => {
         const f = forces[node.id];
         const v = velocities[node.id];
 
-        // Update velocity
         v.vx = (v.vx + f.fx) * damping;
         v.vy = (v.vy + f.fy) * damping;
 
-        // Limit speed to avoid explosion
         const speed = Math.sqrt(v.vx * v.vx + v.vy * v.vy);
         const maxSpeed = 30;
         if (speed > maxSpeed) {
@@ -192,18 +291,58 @@ export default function NetworkGraph({
 
         return {
           ...node,
-          x: Math.round(node.x + v.vx),
-          y: Math.round(node.y + v.vy),
+          x: node.x + v.vx,
+          y: node.y + v.vy,
+        };
+      });
+    }
+
+    // Now we animate from the initial nodes position to the optimal positions using a smooth cubic ease-in-out curve
+    const startPositions = nodes.reduce((acc, node) => {
+      acc[node.id] = { x: node.x, y: node.y };
+      return acc;
+    }, {} as Record<string, { x: number; y: number }>);
+
+    const targetPositions = simNodes.reduce((acc, node) => {
+      acc[node.id] = { x: node.x, y: node.y };
+      return acc;
+    }, {} as Record<string, { x: number; y: number }>);
+
+    const animationDuration = 850; // elegantly paced movement
+    let startTime: number | null = null;
+
+    const easeInOutCubic = (t: number): number => {
+      return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    };
+
+    const animate = (currentTime: number) => {
+      if (!startTime) startTime = currentTime;
+      const elapsed = currentTime - startTime;
+      const progress = Math.min(elapsed / animationDuration, 1);
+      const easedProgress = easeInOutCubic(progress);
+
+      const animatedNodes = nodes.map((node) => {
+        const start = startPositions[node.id] || { x: node.x, y: node.y };
+        const target = targetPositions[node.id] || { x: node.x, y: node.y };
+
+        return {
+          ...node,
+          // Interpolate coordinates smoothly
+          x: Math.round(start.x + (target.x - start.x) * easedProgress),
+          y: Math.round(start.y + (target.y - start.y) * easedProgress),
         };
       });
 
-      onUpdateNodes(currentNodes);
+      onUpdateNodes(animatedNodes);
 
-      frame++;
-      requestAnimationFrame(step);
+      if (progress < 1) {
+        layoutAnimRef.current = requestAnimationFrame(animate);
+      } else {
+        layoutAnimRef.current = null;
+      }
     };
 
-    requestAnimationFrame(step);
+    layoutAnimRef.current = requestAnimationFrame(animate);
   };
 
   const handleWheel = (e: React.WheelEvent<SVGSVGElement>) => {
@@ -245,7 +384,6 @@ export default function NetworkGraph({
       setPanX(e.clientX - dragStart.x);
       setPanY(e.clientY - dragStart.y);
     } else if (draggedNodeId) {
-      if (isReadOnly) return;
       // Node Dragging
       if (!svgRef.current) return;
       const rect = svgRef.current.getBoundingClientRect();
@@ -289,6 +427,13 @@ export default function NetworkGraph({
   // Node drag initiation
   const handleNodeMouseDown = (e: React.MouseEvent, node: EducationalNode) => {
     e.stopPropagation();
+    
+    // Cancel any active layout animation if user begins dragging
+    if (layoutAnimRef.current !== null) {
+      cancelAnimationFrame(layoutAnimRef.current);
+      layoutAnimRef.current = null;
+    }
+
     // Do not call onSelectNode(node.id) immediately on mousedown - we select on short click / mouse up instead
     if (!svgRef.current) return;
 
@@ -500,19 +645,15 @@ export default function NetworkGraph({
         <div className="px-2 text-[10px] font-mono text-neutral-400 dark:text-neutral-500 font-medium">
           {Math.round(zoomScale * 100)}%
         </div>
-        {!isReadOnly && (
-          <>
-            <div className="h-4 w-px bg-neutral-200 dark:bg-neutral-800 mx-1" />
-            <button
-              onClick={handleAutoLayout}
-              className="p-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg text-indigo-600 dark:text-indigo-400 font-medium text-xs flex items-center gap-1.5 transition cursor-pointer select-none"
-              title="Spread out nodes to be equidistant, connected nodes closer"
-            >
-              <Sparkles className="w-4 h-4 text-indigo-500" />
-              <span className="hidden sm:inline font-sans text-[11px] font-semibold text-neutral-700 dark:text-neutral-300">Arrange Map</span>
-            </button>
-          </>
-        )}
+        <div className="h-4 w-px bg-neutral-200 dark:bg-neutral-800 mx-1" />
+        <button
+          onClick={handleAutoLayout}
+          className="p-1.5 hover:bg-neutral-100 dark:hover:bg-neutral-800 rounded-lg text-indigo-600 dark:text-indigo-400 font-medium text-xs flex items-center gap-1.5 transition cursor-pointer select-none"
+          title="Spread out nodes to be equidistant, connected nodes closer"
+        >
+          <Sparkles className="w-4 h-4 text-indigo-500" />
+          <span className="hidden sm:inline font-sans text-[11px] font-semibold text-neutral-700 dark:text-neutral-300">Arrange Map</span>
+        </button>
       </div>
 
       {/* Primary SVG Board */}
