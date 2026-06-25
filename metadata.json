@@ -1,0 +1,6 @@
+{
+  "name": "Knowledge Mapper",
+  "description": "Interactive relationship mapping, chronological timelines, flashcards, diagnostic assessments, and Google Sheets bulk storage integration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
